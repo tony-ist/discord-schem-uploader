@@ -1,8 +1,8 @@
 # Discord Schem Uploader
 
-## Setup
+This is add-on mod for [Mc2Discord](https://modrinth.com/mod/mc2discord) that allows you to download and upload your WorlEdit schematics via discord channel.
 
-For setup instructions, please see the [Fabric Documentation page](https://docs.fabricmc.net/develop/getting-started/creating-a-project#setting-up) related to the IDE that you are using.
+It can also download [MCVCS](https://github.com/tony-ist/MCVCS) schematics if present.
 
 ## License
 
