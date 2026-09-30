@@ -43,7 +43,8 @@ dependencies {
 
 	// Mc2Discord (Discord bot). The published jar shades Discord4J/Reactor under
 	// fr.denisd3d.mc2discord.shadow.*, so import those relocated packages, not discord4j.*
-	implementation "maven.modrinth:mc2discord:${project.mc2discord_version}"
+	// Patched build (Discord4J 3.3.3 on MC 26.1.2) from ../Mc2Discord/mc2discord-26.1; see gradle.properties.
+	implementation files("libs/mc2discord-fabric-26.1.2-${project.mc2discord_version}.jar")
 }
 
 processResources {

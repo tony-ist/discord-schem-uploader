@@ -3,6 +3,7 @@ package tony.discordschemuploader;
 import fr.denisd3d.mc2discord.core.Mc2Discord;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
@@ -20,6 +21,8 @@ public class DiscordSchemUploader implements ModInitializer {
 
 	@Override
 	public void onInitialize() {
+		ServerTickEvents.END_SERVER_TICK.register(server -> SchemCommands.tick());
+
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
 				dispatcher.register(Commands.literal("schemdiscord")
 						.then(Commands.literal("status").executes(ctx -> {
