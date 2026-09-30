@@ -29,6 +29,7 @@ import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.Locale;
@@ -37,8 +38,8 @@ import java.util.stream.Stream;
 /**
  * Discord slash commands for WorldEdit schematics:
  * <ul>
- *     <li>{@code /upload file} saves the attached .schem file into WorldEdit's schematics folder
- *     under its original filename.</li>
+ *     <li>{@code /upload file [force]} saves the attached .schem file into WorldEdit's schematics
+ *     folder under its original filename; {@code force} overwrites an existing one.</li>
  *     <li>{@code /download name} posts a schematic from that folder, with autocomplete on names.</li>
  * </ul>
  *
@@ -52,6 +53,7 @@ public final class SchemCommands {
 	private static final String DOWNLOAD = "download";
 	private static final String FILE_OPTION = "file";
 	private static final String NAME_OPTION = "name";
+	private static final String FORCE_OPTION = "force";
 	private static final String EXTENSION = ".schem";
 
 	/** Discord caps autocomplete at 25 choices of at most 100 characters each. */
@@ -111,6 +113,12 @@ public final class SchemCommands {
 								.type(ApplicationCommandOption.Type.ATTACHMENT.getValue())
 								.required(true)
 								.build())
+						.addOption(ApplicationCommandOptionData.builder()
+								.name(FORCE_OPTION)
+								.description("Overwrite an existing schematic with the same name")
+								.type(ApplicationCommandOption.Type.BOOLEAN.getValue())
+								.required(false)
+								.build())
 						.build(),
 				ApplicationCommandRequest.builder()
 						.name(DOWNLOAD)
@@ -164,16 +172,21 @@ public final class SchemCommands {
 		if (target == null) {
 			return refuse(event, "`" + filename + "` is not a valid schematic filename.");
 		}
-		if (Files.exists(target)) {
-			return refuse(event, "A schematic named `" + filename + "` already exists.");
+		boolean force = event.getOption(FORCE_OPTION)
+				.flatMap(ApplicationCommandInteractionOption::getValue)
+				.map(ApplicationCommandInteractionOptionValue::asBoolean)
+				.orElse(false);
+		boolean existed = Files.exists(target);
+		if (existed && !force) {
+			return refuse(event, alreadyExists(filename));
 		}
 
 		return event.deferReply()
 				.then(fetch(attachment.getUrl()))
-				.flatMap(bytes -> Mono.fromCallable(() -> save(dir, target, bytes)))
-				.flatMap(saved -> event.editReply(saved
-						? "Uploaded `" + filename + "`."
-						: "A schematic named `" + filename + "` already exists.").then())
+				.flatMap(bytes -> Mono.fromCallable(() -> save(dir, target, bytes, force)))
+				.flatMap(saved -> event.editReply(!saved
+						? alreadyExists(filename)
+						: existed ? "Replaced `" + filename + "`." : "Uploaded `" + filename + "`.").then())
 				.onErrorResume(e -> {
 					DiscordSchemUploader.LOGGER.error("Failed to upload schematic {}", filename, e);
 					return event.editReply("Failed to upload `" + filename + "`.").then();
@@ -278,9 +291,28 @@ public final class SchemCommands {
 						: Mono.error(new IOException("Attachment download returned HTTP " + response.statusCode())));
 	}
 
-	/** Writes the file; returns false if a file with that name appeared in the meantime. */
-	private static boolean save(Path dir, Path target, byte[] bytes) throws IOException {
+	private static String alreadyExists(String filename) {
+		return "A schematic named `" + filename + "` already exists. Use `" + FORCE_OPTION + ": True` to overwrite it.";
+	}
+
+	/**
+	 * Writes the file. With {@code force} an existing file is replaced atomically, so a failed write
+	 * never leaves a truncated schematic behind; otherwise returns false if a file with that name
+	 * appeared in the meantime.
+	 */
+	private static boolean save(Path dir, Path target, byte[] bytes, boolean force) throws IOException {
 		Files.createDirectories(dir);
+		if (force) {
+			Path temp = Files.createTempFile(dir, ".upload-", ".tmp");
+			try {
+				Files.write(temp, bytes);
+				Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+			} finally {
+				Files.deleteIfExists(temp);
+			}
+			DiscordSchemUploader.LOGGER.info("Saved uploaded schematic {} (overwrite)", target);
+			return true;
+		}
 		try {
 			Files.write(target, bytes, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
 			DiscordSchemUploader.LOGGER.info("Saved uploaded schematic {}", target);
