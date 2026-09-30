@@ -1,0 +1,39 @@
+{
+	"schemaVersion": 1,
+	"id": "discord-schem-uploader",
+	"version": "${version}",
+	"name": "Discord Schem Uploader",
+	"description": "This is an example description! Tell everyone what your mod is about!",
+	"authors": [
+		"Me!"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/discord-schem-uploader/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"tony.discordschemuploader.DiscordSchemUploader"
+		],
+		"client": [
+			"tony.discordschemuploader.client.DiscordSchemUploaderClient"
+		]
+	},
+	"mixins": [
+		"discord-schem-uploader.mixins.json",
+		{
+			"config": "discord-schem-uploader.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.1.2",
+		"java": ">=25",
+		"fabric-api": "*",
+		"mc2discord": "*"
+	}
+}
