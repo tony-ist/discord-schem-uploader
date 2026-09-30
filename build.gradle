@@ -70,6 +70,13 @@ java {
 	targetCompatibility = JavaVersion.VERSION_25
 }
 
+// Name built jars like discord-schem-uploader-1.1.0-fabric+mc26.1.2.jar.
+// Only the file name changes; the mod version in fabric.mod.json stays plain.
+def archiveVersionString = "${project.version}-fabric+mc${project.minecraft_version}"
+tasks.withType(AbstractArchiveTask).configureEach {
+	archiveVersion = archiveVersionString
+}
+
 jar {
 	def projectName = project.name
 	inputs.property "projectName", projectName
