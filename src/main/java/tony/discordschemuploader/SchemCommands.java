@@ -1,5 +1,7 @@
 package tony.discordschemuploader;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import fr.denisd3d.mc2discord.core.Mc2Discord;
 import fr.denisd3d.mc2discord.shadow.discord4j.common.util.Snowflake;
 import fr.denisd3d.mc2discord.shadow.discord4j.core.GatewayDiscordClient;
@@ -31,8 +33,13 @@ import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
@@ -41,6 +48,8 @@ import java.util.stream.Stream;
  *     <li>{@code /upload file [force]} saves the attached .schem file into WorldEdit's schematics
  *     folder under its original filename; {@code force} overwrites an existing one.</li>
  *     <li>{@code /download name} posts a schematic from that folder, with autocomplete on names.</li>
+ *     <li>{@code /vcsdownload build [version]} posts a version of an MCVCS build, the latest one by default,
+ *     with autocomplete on builds and on the chosen build's versions.</li>
  * </ul>
  *
  * <p>Piggybacks on Mc2Discord's bot. Commands are accepted only in channels listed in
@@ -51,10 +60,16 @@ import java.util.stream.Stream;
 public final class SchemCommands {
 	private static final String UPLOAD = "upload";
 	private static final String DOWNLOAD = "download";
+	private static final String VCS_DOWNLOAD = "vcsdownload";
 	private static final String FILE_OPTION = "file";
 	private static final String NAME_OPTION = "name";
 	private static final String FORCE_OPTION = "force";
+	private static final String BUILD_OPTION = "build";
+	private static final String VERSION_OPTION = "version";
 	private static final String EXTENSION = ".schem";
+
+	/** MCVCS's {@code Build.NAME}; also keeps build names from escaping the MCVCS folder. */
+	private static final Pattern MCVCS_BUILD_NAME = Pattern.compile("[A-Za-z0-9_+][A-Za-z0-9_+-]*(\\.[A-Za-z0-9_+-]+)*");
 
 	/** Discord caps autocomplete at 25 choices of at most 100 characters each. */
 	private static final int MAX_SUGGESTIONS = 25;
@@ -87,6 +102,7 @@ public final class SchemCommands {
 			Mono<Void> handler = switch (event.getCommandName()) {
 				case UPLOAD -> handleUpload(event);
 				case DOWNLOAD -> handleDownload(event);
+				case VCS_DOWNLOAD -> handleVcsDownload(event);
 				default -> Mono.empty();
 			};
 			return handler.onErrorResume(e -> {
@@ -95,13 +111,23 @@ public final class SchemCommands {
 			});
 		}).subscribe();
 
-		client.on(ChatInputAutoCompleteEvent.class, event -> DOWNLOAD.equals(event.getCommandName())
-						? suggestSchematics(event).onErrorResume(e -> {
-							DiscordSchemUploader.LOGGER.error("Failed to autocomplete /{}", DOWNLOAD, e);
-							return Mono.empty();
-						})
-						: Mono.empty())
-				.subscribe();
+		client.on(ChatInputAutoCompleteEvent.class, event -> {
+			if (!isAllowedChannel(event.getInteraction())) {
+				return event.respondWithSuggestions(List.of());
+			}
+			Mono<List<ApplicationCommandOptionChoiceData>> suggestions = switch (event.getCommandName()) {
+				case DOWNLOAD -> suggestSchematics(typed(event));
+				case VCS_DOWNLOAD -> BUILD_OPTION.equals(event.getFocusedOption().getName())
+						? suggestBuilds(typed(event))
+						: suggestVersions(optionString(event.getOption(BUILD_OPTION)), typed(event));
+				default -> Mono.empty();
+			};
+			return suggestions.flatMap(event::respondWithSuggestions)
+					.onErrorResume(e -> {
+						DiscordSchemUploader.LOGGER.error("Failed to autocomplete /{}", event.getCommandName(), e);
+						return Mono.empty();
+					});
+		}).subscribe();
 
 		List<ApplicationCommandRequest> requests = List.of(
 				ApplicationCommandRequest.builder()
@@ -129,6 +155,25 @@ public final class SchemCommands {
 								.type(ApplicationCommandOption.Type.STRING.getValue())
 								.required(true)
 								.autocomplete(true)
+								.build())
+						.build(),
+				ApplicationCommandRequest.builder()
+						.name(VCS_DOWNLOAD)
+						.description("Download a version of an MCVCS build")
+						.addOption(ApplicationCommandOptionData.builder()
+								.name(BUILD_OPTION)
+								.description("The build's name")
+								.type(ApplicationCommandOption.Type.STRING.getValue())
+								.required(true)
+								.autocomplete(true)
+								.build())
+						.addOption(ApplicationCommandOptionData.builder()
+								.name(VERSION_OPTION)
+								.description("The version number; the latest one if left out")
+								.type(ApplicationCommandOption.Type.INTEGER.getValue())
+								.required(false)
+								.autocomplete(true)
+								.minValue(1.0)
 								.build())
 						.build());
 
@@ -198,11 +243,7 @@ public final class SchemCommands {
 			return refuse(event, "Schematics can't be downloaded in this channel.");
 		}
 
-		String name = event.getOption(NAME_OPTION)
-				.flatMap(ApplicationCommandInteractionOption::getValue)
-				.map(ApplicationCommandInteractionOptionValue::asString)
-				.map(String::strip)
-				.orElse("");
+		String name = optionString(event.getOption(NAME_OPTION));
 		// Accept "house" as well as "house.schem" when the user didn't pick a suggestion.
 		String filename = isSchematicName(name) ? name : name + EXTENSION;
 
@@ -210,39 +251,151 @@ public final class SchemCommands {
 		if (target == null || !Files.isRegularFile(target)) {
 			return refuse(event, "No schematic named `" + filename + "`.");
 		}
+		return sendFile(event, target);
+	}
 
+	private static Mono<Void> handleVcsDownload(ChatInputInteractionEvent event) {
+		if (!isAllowedChannel(event.getInteraction())) {
+			return refuse(event, "Builds can't be downloaded in this channel.");
+		}
+
+		String name = optionString(event.getOption(BUILD_OPTION));
+		McvcsBuild build = readMcvcsBuild(name).orElse(null);
+		if (build == null) {
+			return refuse(event, "No MCVCS build named `" + name + "`.");
+		}
+
+		long version = event.getOption(VERSION_OPTION)
+				.flatMap(ApplicationCommandInteractionOption::getValue)
+				.map(ApplicationCommandInteractionOptionValue::asLong)
+				.orElse((long) build.latest());
+		if (!build.versions().contains(version)) {
+			return refuse(event, "Build `" + name + "` has no version " + version + "; the latest is " + build.latest() + ".");
+		}
+		return sendFile(event, build.schematic(version));
+	}
+
+	private static Mono<Void> sendFile(ChatInputInteractionEvent event, Path file) {
+		String filename = file.getFileName().toString();
 		return event.deferReply()
-				.then(Mono.fromCallable(() -> Files.readAllBytes(target)))
+				.then(Mono.fromCallable(() -> Files.readAllBytes(file)))
 				.flatMap(bytes -> event.editReply()
 						.withFiles(MessageCreateFields.File.of(filename, new ByteArrayInputStream(bytes)))
 						.then())
 				.onErrorResume(e -> {
-					DiscordSchemUploader.LOGGER.error("Failed to send schematic {}", filename, e);
+					DiscordSchemUploader.LOGGER.error("Failed to send {}", file, e);
 					return event.editReply("Failed to send `" + filename + "`.").then();
 				});
 	}
 
-	/** Suggests schematic filenames containing what the user has typed so far. */
-	private static Mono<Void> suggestSchematics(ChatInputAutoCompleteEvent event) {
-		if (!isAllowedChannel(event.getInteraction())) {
-			return event.respondWithSuggestions(List.of());
-		}
+	/** Schematic filenames containing what the user has typed so far. */
+	private static Mono<List<ApplicationCommandOptionChoiceData>> suggestSchematics(String typed) {
+		return Mono.fromCallable(() -> choices(listSchematics().stream()
+				.filter(name -> name.toLowerCase(Locale.ROOT).contains(typed))
+				.map(name -> new Choice(name, name))));
+	}
 
-		String typed = event.getFocusedOption().getValue()
+	/** MCVCS build names containing what the user has typed so far. */
+	private static Mono<List<ApplicationCommandOptionChoiceData>> suggestBuilds(String typed) {
+		return Mono.fromCallable(() -> choices(listMcvcsBuilds().stream()
+				.filter(build -> build.name().toLowerCase(Locale.ROOT).contains(typed))
+				.map(build -> new Choice(build.name() + " (latest v" + build.latest() + ")", build.name()))));
+	}
+
+	/** Versions of the build chosen so far, newest first, whose number starts with what the user has typed. */
+	private static Mono<List<ApplicationCommandOptionChoiceData>> suggestVersions(String buildName, String typed) {
+		return Mono.fromCallable(() -> readMcvcsBuild(buildName)
+				.map(build -> choices(build.versions().stream()
+						.sorted(Comparator.reverseOrder())
+						.filter(version -> version.toString().startsWith(typed))
+						.map(version -> new Choice(
+								"v" + version + (version == build.latest() ? " (latest)" : ""), version))))
+				.orElse(List.of()));
+	}
+
+	/** The first {@link #MAX_SUGGESTIONS} of {@code choices} that fit Discord's limits. */
+	private static List<ApplicationCommandOptionChoiceData> choices(Stream<Choice> choices) {
+		return choices.filter(choice -> choice.label().length() <= MAX_CHOICE_LENGTH
+						&& choice.value().toString().length() <= MAX_CHOICE_LENGTH)
+				.limit(MAX_SUGGESTIONS)
+				.map(choice -> (ApplicationCommandOptionChoiceData) ApplicationCommandOptionChoiceData.builder()
+						.name(choice.label())
+						.value(choice.value())
+						.build())
+				.toList();
+	}
+
+	/** One autocomplete suggestion: what the user sees and what the command receives. */
+	private record Choice(String label, Object value) {
+	}
+
+	/** What the user has typed so far into the option being autocompleted, lower-cased. */
+	private static String typed(ChatInputAutoCompleteEvent event) {
+		return event.getFocusedOption().getValue()
 				.map(ApplicationCommandInteractionOptionValue::getRaw)
 				.orElse("")
 				.strip()
 				.toLowerCase(Locale.ROOT);
+	}
 
-		return Mono.fromCallable(() -> listSchematics().stream()
-						.filter(name -> name.toLowerCase(Locale.ROOT).contains(typed))
-						.limit(MAX_SUGGESTIONS)
-						.map(name -> (ApplicationCommandOptionChoiceData) ApplicationCommandOptionChoiceData.builder()
-								.name(name)
-								.value(name)
-								.build())
-						.toList())
-				.flatMap(event::respondWithSuggestions);
+	private static String optionString(Optional<ApplicationCommandInteractionOption> option) {
+		return option.flatMap(ApplicationCommandInteractionOption::getValue)
+				.map(ApplicationCommandInteractionOptionValue::getRaw)
+				.map(String::strip)
+				.orElse("");
+	}
+
+	/**
+	 * An MCVCS build: its latest version and every version whose schematic is on disk. MCVCS keeps each build in
+	 * {@code mcvcs/<name>/}: a {@code build.json} whose {@code version} is the latest version and whose
+	 * {@code versions} has a key per version, and one {@code <name>-v<N>.schem} per version.
+	 */
+	private record McvcsBuild(String name, int latest, Set<Long> versions, Path folder) {
+		Path schematic(long version) {
+			return folder.resolve(name + "-v" + version + EXTENSION);
+		}
+	}
+
+	/** Every MCVCS build whose latest version is on disk, from every world, sorted by name. */
+	private static List<McvcsBuild> listMcvcsBuilds() throws IOException {
+		Path root = mcvcsDir();
+		if (!Files.isDirectory(root)) {
+			return List.of();
+		}
+		try (Stream<Path> folders = Files.list(root)) {
+			return folders.filter(Files::isDirectory)
+					.map(folder -> readMcvcsBuild(folder.getFileName().toString()))
+					.flatMap(Optional::stream)
+					.sorted(Comparator.comparing(McvcsBuild::name, String.CASE_INSENSITIVE_ORDER))
+					.toList();
+		}
+	}
+
+	/** The MCVCS build called {@code name}, if it exists and its latest version is on disk. */
+	private static Optional<McvcsBuild> readMcvcsBuild(String name) {
+		if (!MCVCS_BUILD_NAME.matcher(name).matches()) {
+			return Optional.empty();
+		}
+		Path folder = mcvcsDir().resolve(name);
+		Path buildFile = folder.resolve("build.json");
+		if (!Files.isRegularFile(buildFile)) {
+			return Optional.empty();
+		}
+		try {
+			JsonObject json = JsonParser.parseString(Files.readString(buildFile)).getAsJsonObject();
+			int latest = json.get("version").getAsInt();
+			McvcsBuild build = new McvcsBuild(name, latest, new TreeSet<>(), folder);
+			for (String key : json.getAsJsonObject("versions").keySet()) {
+				long version = Long.parseLong(key);
+				if (Files.isRegularFile(build.schematic(version))) {
+					build.versions().add(version);
+				}
+			}
+			return build.versions().contains((long) latest) ? Optional.of(build) : Optional.empty();
+		} catch (IOException | RuntimeException e) {
+			DiscordSchemUploader.LOGGER.warn("Skipping unreadable MCVCS build {}", buildFile, e);
+			return Optional.empty();
+		}
 	}
 
 	/** Filenames of the .schem files directly in the schematics folder, sorted case-insensitively. */
@@ -324,6 +477,11 @@ public final class SchemCommands {
 
 	private static Mono<Void> refuse(ChatInputInteractionEvent event, String message) {
 		return event.reply(message).withEphemeral(true).then();
+	}
+
+	/** MCVCS keeps its builds in {@code mcvcs/} in the game directory. */
+	private static Path mcvcsDir() {
+		return FabricLoader.getInstance().getGameDir().resolve("mcvcs").toAbsolutePath().normalize();
 	}
 
 	/** WorldEdit for Fabric keeps schematics in {@code config/worldedit/schematics}. */
